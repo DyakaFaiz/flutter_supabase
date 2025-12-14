@@ -19,7 +19,7 @@ class _TaskListScreenState extends State<TaskListScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_hasLoaded) {
         _hasLoaded = true;
-        context.read<TaskProvider>().loadTasks();
+        context.read<TaskProvider>().loadTasksOfflineFirst();
       }
     });
   }
@@ -30,15 +30,33 @@ class _TaskListScreenState extends State<TaskListScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('My Tasks (${taskProvider.tasks.length})'),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('My Tasks (${taskProvider.tasks.length})'),
+            const SizedBox(height: 2),
+            _buildSyncSubtitle(taskProvider),
+          ],
+        ),
         actions: [
+          // Ikon status sync sederhana
+          Padding(
+            padding: const EdgeInsets.only(right: 8.0),
+            child: Center(
+              child: taskProvider.isSyncing
+                  ? const Icon(Icons.sync, color: Colors.yellowAccent)
+                  : (taskProvider.unsyncedCount > 0
+                      ? const Icon(Icons.cloud_off, color: Colors.orangeAccent)
+                      : const Icon(Icons.cloud_done, color: Colors.greenAccent)),
+            ),
+          ),
           IconButton(
-            icon: Icon(Icons.refresh),
-            onPressed: () => taskProvider.loadTasks(),
+            icon: const Icon(Icons.refresh),
+            onPressed: () => taskProvider.loadTasksOfflineFirst(),
           ),
           PopupMenuButton(
             itemBuilder: (context) => [
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'logout',
                 child: Row(
                   children: [
@@ -66,31 +84,60 @@ class _TaskListScreenState extends State<TaskListScreen> {
           );
 
           if (result == true) {
-            taskProvider.loadTasks();
+            taskProvider.loadTasksOfflineFirst();
           }
         },
-        child: Icon(Icons.add),
+        child: const Icon(Icons.add),
       ),
     );
   }
 
-  Widget _buildBody(TaskProvider taskProvider) {
-    if (taskProvider.isTaskLoading) {
-      return Center(child: CircularProgressIndicator());
+  Widget _buildSyncSubtitle(TaskProvider taskProvider) {
+    if (taskProvider.isTaskLoading && taskProvider.tasks.isEmpty) {
+      return const Text(
+        'Memuat data lokal...',
+        style: TextStyle(fontSize: 12),
+      );
     }
 
-    if (taskProvider.errorMessage != null) {
+    if (taskProvider.isSyncing) {
+      return const Text(
+        'Sinkronisasi dengan server...',
+        style: TextStyle(fontSize: 12),
+      );
+    }
+
+    if (taskProvider.unsyncedCount > 0) {
+      return Text(
+        '${taskProvider.unsyncedCount} task belum tersinkron',
+        style: const TextStyle(fontSize: 12),
+      );
+    }
+
+    return const Text(
+      'Semua data tersinkron',
+      style: TextStyle(fontSize: 12),
+    );
+  }
+
+  Widget _buildBody(TaskProvider taskProvider) {
+    if (taskProvider.isTaskLoading && taskProvider.tasks.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (taskProvider.errorMessage != null &&
+        taskProvider.tasks.isEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.error_outline, size: 64, color: Colors.red),
-            SizedBox(height: 16),
+            const Icon(Icons.error_outline, size: 64, color: Colors.red),
+            const SizedBox(height: 16),
             Text(taskProvider.errorMessage!),
-            SizedBox(height: 16),
+            const SizedBox(height: 16),
             ElevatedButton(
-              onPressed: () => taskProvider.loadTasks(),
-              child: Text('Coba Lagi'),
+              onPressed: () => taskProvider.loadTasksOfflineFirst(),
+              child: const Text('Coba Lagi'),
             ),
           ],
         ),
@@ -101,7 +148,7 @@ class _TaskListScreenState extends State<TaskListScreen> {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
-          children: [
+          children: const [
             Icon(Icons.task_alt, size: 64, color: Colors.grey),
             SizedBox(height: 16),
             Text('Belum ada tasks', style: TextStyle(fontSize: 18)),
@@ -112,13 +159,16 @@ class _TaskListScreenState extends State<TaskListScreen> {
       );
     }
 
-    return ListView.builder(
-      padding: EdgeInsets.all(8),
-      itemCount: taskProvider.tasks.length,
-      itemBuilder: (context, index) {
-        final task = taskProvider.tasks[index];
-        return TaskCard(task: task);
-      },
+    return RefreshIndicator(
+      onRefresh: () => taskProvider.loadTasksOfflineFirst(),
+      child: ListView.builder(
+        padding: const EdgeInsets.all(8),
+        itemCount: taskProvider.tasks.length,
+        itemBuilder: (context, index) {
+          final task = taskProvider.tasks[index];
+          return TaskCard(task: task);
+        },
+      ),
     );
   }
 }
@@ -130,26 +180,41 @@ class TaskCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      margin: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      child: ListTile(
-        leading: Checkbox(
-          value: task.completed,
-          onChanged: task.completed
-              ? null
-              : (value) async {
-                  final success =
-                      await context.read<TaskProvider>().toggleTask(task);
+    final isUnsynced = !task.isSynced;
 
-                  if (!success && context.mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                        content: Text('Gagal update task'),
-                        backgroundColor: Colors.red,
-                      ),
-                    );
-                  }
-                },
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      child: ListTile(
+        leading: Stack(
+          alignment: Alignment.bottomRight,
+          children: [
+            Checkbox(
+              value: task.completed,
+              onChanged: (value) async {
+                final success =
+                    await context.read<TaskProvider>().toggleTask(task);
+
+                if (!success && context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Gagal update task'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                }
+              },
+            ),
+            if (isUnsynced)
+              const Positioned(
+                right: 0,
+                bottom: 0,
+                child: Icon(
+                  Icons.offline_bolt,
+                  size: 14,
+                  color: Colors.orangeAccent,
+                ),
+              ),
+          ],
         ),
         title: Text(
           task.title,
@@ -158,17 +223,26 @@ class TaskCard extends StatelessWidget {
             color: task.completed ? Colors.grey : null,
           ),
         ),
-        subtitle: task.description.isNotEmpty
-            ? Text(
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (task.description.isNotEmpty)
+              Text(
                 task.description,
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
-              )
-            : null,
+              ),
+            if (isUnsynced)
+              const Text(
+                'Belum terkirim ke server',
+                style: TextStyle(fontSize: 11, color: Colors.orange),
+              ),
+          ],
+        ),
         trailing: task.completed
-            ? Icon(Icons.check_circle, color: Colors.green)
+            ? const Icon(Icons.check_circle, color: Colors.green)
             : PopupMenuButton(
-                itemBuilder: (context) => [
+                itemBuilder: (context) => const [
                   PopupMenuItem(
                     value: 'delete',
                     child: Row(
@@ -185,16 +259,17 @@ class TaskCard extends StatelessWidget {
                     final confirm = await showDialog<bool>(
                       context: context,
                       builder: (context) => AlertDialog(
-                        title: Text('Hapus Task'),
-                        content: Text('Yakin ingin menghapus task ini?'),
+                        title: const Text('Hapus Task'),
+                        content:
+                            const Text('Yakin ingin menghapus task ini?'),
                         actions: [
                           TextButton(
                             onPressed: () => Navigator.pop(context, false),
-                            child: Text('Batal'),
+                            child: const Text('Batal'),
                           ),
                           TextButton(
                             onPressed: () => Navigator.pop(context, true),
-                            child: Text('Hapus'),
+                            child: const Text('Hapus'),
                           ),
                         ],
                       ),
@@ -203,15 +278,15 @@ class TaskCard extends StatelessWidget {
                     if (confirm == true && context.mounted) {
                       final success = await context
                           .read<TaskProvider>()
-                          .deleteTask(task.id!);
+                          .deleteTask(task);
 
                       if (success && context.mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text('Task dihapus')),
+                          const SnackBar(content: Text('Task dihapus')),
                         );
                       } else if (context.mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
+                          const SnackBar(
                             content: Text('Gagal menghapus task'),
                             backgroundColor: Colors.red,
                           ),

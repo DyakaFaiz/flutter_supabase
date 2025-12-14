@@ -1,12 +1,14 @@
 import 'package:flutter/material.dart';
+import 'package:latihan_supabase/local/task_local_db.dart';
 
 import '../api/task_api.dart';
 import '../models/task.dart';
 
 class TaskProvider extends ChangeNotifier {
   final TaskApiService _apiService;
+  final TaskLocalDb _localDb;
 
-  TaskProvider(this._apiService);
+  TaskProvider(this._apiService, this._localDb);
 
   // Auth state
   bool _isAuthenticated = false;
@@ -19,15 +21,21 @@ class TaskProvider extends ChangeNotifier {
   // Task state
   List<Task> _tasks = [];
 
+  bool _isSyncing = false;
+
   // Getters
   bool get isAuthenticated => _isAuthenticated;
   bool get isLoading => _isAuthLoading; // For backward compatibility
   bool get isAuthLoading => _isAuthLoading;
   bool get isTaskLoading => _isTaskLoading;
+  bool get isSyncing => _isSyncing;
   String? get email => _email;
   String? get userId => _userId;
   String? get errorMessage => _errorMessage;
   List<Task> get tasks => _tasks;
+
+  int get unsyncedCount =>
+      _tasks.where((task) => task.isSynced == false).length;
 
   // Check saved session on app start
   Future<void> checkSession() async {
@@ -39,6 +47,7 @@ class TaskProvider extends ChangeNotifier {
       _isAuthenticated = true;
       _email = session['email'];
       _userId = session['userId'];
+      await loadTasksOfflineFirst();
     }
 
     _isAuthLoading = false;
@@ -59,6 +68,8 @@ class TaskProvider extends ChangeNotifier {
       _isAuthenticated = true;
       _email = result['user']['email'];
       _userId = result['user']['id'];
+      await loadTasksOfflineFirst();
+
       notifyListeners();
       return true;
     } else {
@@ -82,6 +93,9 @@ class TaskProvider extends ChangeNotifier {
       _isAuthenticated = true;
       _email = result['user']['email'];
       _userId = result['user']['id'].toString();
+
+      await loadTasksOfflineFirst();
+
       notifyListeners();
       return true;
     } else {
@@ -94,12 +108,58 @@ class TaskProvider extends ChangeNotifier {
   // Logout
   Future<void> logout() async {
     await _apiService.logout();
+    await _localDb.clearAll();
+
     _isAuthenticated = false;
     _email = null;
     _userId = null;
     _tasks = [];
     notifyListeners();
   }
+
+  Future<void> loadTasksOfflineFirst() async {
+    if (_userId == null) return;
+
+    _isTaskLoading = true;
+    _errorMessage = null;
+    notifyListeners();
+
+    try {
+      // 1. Baca dari lokal terlebih dahulu
+      _tasks = await _localDb.getAllTasks();
+      notifyListeners();
+
+      // 2. Coba sync dengan server
+      _isSyncing = true;
+      notifyListeners();
+
+      // Ambil semua tasks dari server
+      final remoteTasks = await _apiService.getTasks();
+
+      // Map hasil remote agar punya userId & flag isSynced true
+      final normalizedRemote = remoteTasks.map((t) {
+        return t.copyWith(
+          userId: _userId!,
+          isSynced: true,
+        );
+      }).toList();
+
+      // Ganti isi tabel lokal dengan data server
+      await _localDb.replaceAllTasks(normalizedRemote);
+
+      // Baca ulang dari lokal setelah sync
+      _tasks = await _localDb.getAllTasks();
+      _errorMessage = null;
+    } catch (e) {
+      // Kalau gagal sync (misalnya offline), tetap pakai data lokal
+      _errorMessage = 'Gagal sinkronisasi dengan server (mode offline).';
+    }
+
+    _isSyncing = false;
+    _isTaskLoading = false;
+    notifyListeners();
+  }
+
 
   // === TASK OPERATIONS ===
 
@@ -127,66 +187,148 @@ class TaskProvider extends ChangeNotifier {
   Future<bool> addTask(String title, String description) async {
     if (_userId == null) return false;
 
-    final task = Task(
+    _errorMessage = null;
+
+    // 1. Simpan ke lokal terlebih dahulu (optimistic)
+    final localTask = Task(
       title: title,
       description: description,
       userId: _userId!,
+      completed: false,
+      isSynced: false,
+      createdAt: DateTime.now(),
     );
 
-    final createdTask = await _apiService.createTask(task);
+    final localId = await _localDb.insertTask(localTask);
+    final insertedTask = localTask.copyWith(localId: localId);
 
-    if (createdTask != null) {
-      _tasks.insert(0, createdTask);
+    // Update list di memori
+    _tasks.insert(0, insertedTask);
+    notifyListeners();
+
+    // 2. Coba kirim ke server
+    try {
+      final createdOnServer = await _apiService.createTask(insertedTask);
+
+      if (createdOnServer != null) {
+        // Update record lokal: set serverId & isSynced = true
+        final syncedTask = insertedTask.copyWith(
+          serverId: createdOnServer.serverId,
+          isSynced: true,
+          createdAt: createdOnServer.createdAt ?? insertedTask.createdAt,
+        );
+
+        await _localDb.updateTask(syncedTask);
+
+        // Update di list in-memory
+        final index =
+            _tasks.indexWhere((t) => t.localId == insertedTask.localId);
+        if (index != -1) {
+          _tasks[index] = syncedTask;
+        }
+
+        notifyListeners();
+        return true;
+      } else {
+        // Gagal create ke server, tetap ada di lokal dengan isSynced = false
+        _errorMessage = 'Task disimpan lokal tetapi gagal ke server.';
+        notifyListeners();
+        return true; // dari sudut pandang user, tetap berhasil tersimpan
+      }
+    } catch (e) {
+      // Network error, tetap anggap sukses di lokal
+      _errorMessage = 'Mode offline: task disimpan lokal.';
       notifyListeners();
       return true;
     }
-
-    _errorMessage = 'Gagal menambahkan task';
-    notifyListeners();
-    return false;
   }
 
   // Toggle task completion
   Future<bool> toggleTask(Task task) async {
-    final updatedTask = Task(
-      id: task.id,
-      title: task.title,
-      description: task.description,
+    // 1. Update lokal (optimistic)
+    final updatedLocal = task.copyWith(
       completed: !task.completed,
-      userId: task.userId,
-      createdAt: task.createdAt,
+      isSynced: false, // akan diset true jika sync ke server sukses
     );
 
-    final success = await _apiService.updateTask(updatedTask);
+    await _localDb.updateTask(updatedLocal);
 
-    if (success) {
-      final index = _tasks.indexWhere((t) => t.id == task.id);
-      if (index != -1) {
-        _tasks[index] = updatedTask;
-        notifyListeners();
-      }
+    final index = _tasks.indexWhere((t) => t.localId == task.localId);
+    if (index != -1) {
+      _tasks[index] = updatedLocal;
+      notifyListeners();
+    }
+
+    // 2. Coba update ke server jika ada serverId
+    if (task.serverId == null) {
+      // Belum pernah tersinkron, cukup lokal saja
       return true;
     }
 
-    _errorMessage = 'Gagal mengupdate task';
-    notifyListeners();
-    return false;
-  }
+    try {
+      final success = await _apiService.updateTask(
+        updatedLocal.copyWith(
+          // Pastikan id yang dikirim adalah serverId
+          serverId: task.serverId,
+        ),
+      );
 
-  // Delete task
-  Future<bool> deleteTask(int taskId) async {
-    final success = await _apiService.deleteTask(taskId);
+      if (success) {
+        final syncedTask = updatedLocal.copyWith(
+          isSynced: true,
+        );
 
-    if (success) {
-      _tasks.removeWhere((task) => task.id == taskId);
+        await _localDb.updateTask(syncedTask);
+
+        final idx = _tasks.indexWhere((t) => t.localId == syncedTask.localId);
+        if (idx != -1) {
+          _tasks[idx] = syncedTask;
+          notifyListeners();
+        }
+
+        return true;
+      } else {
+        _errorMessage = 'Gagal mengupdate task di server.';
+        notifyListeners();
+        return false;
+      }
+    } catch (e) {
+      _errorMessage = 'Mode offline: perubahan hanya tersimpan lokal.';
       notifyListeners();
       return true;
     }
-
-    _errorMessage = 'Gagal menghapus task';
-    notifyListeners();
-    return false;
   }
+
+
+  // Delete task
+  Future<bool> deleteTask(Task task) async {
+    if (task.localId == null) return false;
+
+    // 1. Hapus di lokal terlebih dahulu
+    await _localDb.deleteTask(task.localId!);
+    _tasks.removeWhere((t) => t.localId == task.localId);
+    notifyListeners();
+
+    // 2. Jika tidak punya serverId, selesai di sini
+    if (task.serverId == null) {
+      return true;
+    }
+
+    // 3. Hapus di server
+    try {
+      final success = await _apiService.deleteTask(task.serverId!);
+      if (!success) {
+        _errorMessage = 'Gagal menghapus task di server.';
+        notifyListeners();
+      }
+      return success;
+    } catch (e) {
+      _errorMessage = 'Mode offline: task hanya terhapus di lokal.';
+      notifyListeners();
+      return true;
+    }
+  }
+
 
   // Clear error message
   void clearError() {

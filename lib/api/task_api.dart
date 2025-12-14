@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -7,10 +8,13 @@ import '../models/task.dart';
 
 class TaskApiService {
   // Ganti dengan Supabase project Anda
-  static const String _baseUrl = 'https://xxx.supabase.co';
-  static const String _apiKey = 'xxx';
+  final String _baseUrl = dotenv.env['DB_BASE_URL'] ?? '';
+  final String _apiKey = dotenv.env['DB_API_KEY'] ?? '';
 
   String? _accessToken;
+  final http.Client _client;
+
+  TaskApiService({http.Client? client}) : _client = client ?? http.Client();
 
   // Build headers untuk API requests
   Map<String, String> _getHeaders(
@@ -37,7 +41,7 @@ class TaskApiService {
   // Login user
   Future<Map<String, dynamic>?> login(String email, String password) async {
     try {
-      final response = await http.post(
+      final response = await _client.post(
         Uri.parse('$_baseUrl/auth/v1/token?grant_type=password'),
         headers: _getHeaders(includeAuth: false),
         body: jsonEncode({
@@ -62,7 +66,7 @@ class TaskApiService {
   // Register user
   Future<Map<String, dynamic>?> register(String email, String password) async {
     try {
-      final response = await http.post(
+      final response = await _client.post(
         Uri.parse('$_baseUrl/auth/v1/signup'),
         headers: _getHeaders(includeAuth: false),
         body: jsonEncode({
@@ -138,7 +142,7 @@ class TaskApiService {
   // Get all tasks for current user
   Future<List<Task>> getTasks() async {
     try {
-      final response = await http.get(
+      final response = await _client.get(
         Uri.parse('$_baseUrl/rest/v1/tasks?select=*&order=created_at.desc'),
         headers: _getHeaders(),
       );
@@ -161,24 +165,17 @@ class TaskApiService {
   // Create new task
   Future<Task?> createTask(Task task) async {
     try {
-      final response = await http.post(
+      final response = await _client.post(
         Uri.parse('$_baseUrl/rest/v1/tasks'),
         headers: _getHeaders(returnRepresentation: true),
         body: jsonEncode(task.toJson()),
       );
 
-      if (response.statusCode == 201) {
+      if (response.statusCode == 201 || response.statusCode == 200) {
         // Handle empty response
         if (response.body.isEmpty) {
           // Return task with generated ID
-          return Task(
-            id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-            title: task.title,
-            description: task.description,
-            completed: false,
-            userId: task.userId,
-            createdAt: DateTime.now(),
-          );
+          return task;
         }
 
         try {
@@ -192,16 +189,10 @@ class TaskApiService {
           } else {
             return null;
           }
-        } catch (parseError) {
-          // If parsing fails, return basic task
-          return Task(
-            id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-            title: task.title,
-            description: task.description,
-            completed: false,
-            userId: task.userId,
-            createdAt: DateTime.now(),
-          );
+
+        } catch (e) {
+          print('Create task error: $e');
+          return null;
         }
       }
       return null;
@@ -213,11 +204,11 @@ class TaskApiService {
 
   // Update task (toggle completed)
   Future<bool> updateTask(Task task) async {
-    if (task.id == null) return false;
+    if (task.serverId == null) return false;
 
     try {
-      final response = await http.patch(
-        Uri.parse('$_baseUrl/rest/v1/tasks?id=eq.${task.id}'),
+      final response = await _client.patch(
+        Uri.parse('$_baseUrl/rest/v1/tasks?id=eq.${task.serverId}'),
         headers: _getHeaders(),
         body: jsonEncode(task.toJson()),
       );
@@ -230,10 +221,10 @@ class TaskApiService {
   }
 
   // Delete task
-  Future<bool> deleteTask(int taskId) async {
+  Future<bool> deleteTask(int serverId) async {
     try {
-      final response = await http.delete(
-        Uri.parse('$_baseUrl/rest/v1/tasks?id=eq.$taskId'),
+      final response = await _client.delete(
+        Uri.parse('$_baseUrl/rest/v1/tasks?id=eq.$serverId'),
         headers: _getHeaders(),
       );
 
